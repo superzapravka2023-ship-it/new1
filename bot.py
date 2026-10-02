@@ -16,7 +16,7 @@ import config as C
 import storage as db
 from bybit import Bybit, Ticker
 from strategy import Signal, btc_move_pct, scan
-from trade import BybitTrade, TradeManager
+from trade import BybitTrade, TradeManager, plural
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -413,6 +413,58 @@ def screen_account() -> tuple[str, InlineKeyboardMarkup]:
     return "\n".join(out).replace(",", " "), nav(*extra, back="acc")
 
 
+def screen_wipe() -> tuple[str, InlineKeyboardMarkup]:
+    d = db.stats(24 * 3650)
+    rows = db.open_trades()
+    out = ["🧹 <b>ОЧИСТКА СТАТИСТИКИ</b>", "━━━━━━━━━━━━━━━━━━━━",
+           f"<pre>Всего записей   {d['total']}\n"
+           f"  закрытых      {d['closed']}\n"
+           f"  открытых      {len(rows)}</pre>",
+           "<b>Что делает каждая кнопка</b>",
+           "",
+           "🧽 <b>Очистить историю</b> — удаляет только закрытые сделки. "
+           "Статистика обнуляется, открытые позиции остаются под управлением. "
+           "Это то, что нужно в большинстве случаев.",
+           "",
+           "🙈 <b>Забыть открытые</b> — снимает с ведения открытые сделки "
+           "(например, подтянутые от другого бота). "
+           "<b>Позиции на бирже при этом не закрываются</b> — бот просто перестаёт "
+           "за ними следить, закрывать придётся вручную в Bybit.",
+           "",
+           "💣 <b>Стереть всё</b> — и историю, и открытые, и кулдауны. "
+           "Полный чистый лист.",
+           "",
+           "<i>Сами позиции на бирже ни одна кнопка не трогает.</i>"]
+    kb = nav([InlineKeyboardButton(text="🧽 Очистить историю",
+                                   callback_data="wipe:closed")],
+             [InlineKeyboardButton(text="🙈 Забыть открытые",
+                                   callback_data="wipe:open")],
+             [InlineKeyboardButton(text="💣 Стереть всё", callback_data="wipe:all")],
+             back="wipe")
+    return "\n".join(out), kb
+
+
+def screen_wipe_confirm(what: str) -> tuple[str, InlineKeyboardMarkup]:
+    d = db.stats(24 * 3650)
+    n_open = len(db.open_trades())
+    texts = {
+        "closed": (f"Удалить <b>{d['closed']}</b> "
+                   f"{plural(d['closed'], 'закрытую сделку', 'закрытые сделки', 'закрытых сделок')}?\n"
+                   f"Открытые ({n_open}) останутся под управлением."),
+        "open":   (f"Снять с ведения <b>{n_open}</b> "
+                   f"{plural(n_open, 'открытую сделку', 'открытые сделки', 'открытых сделок')}?\n"
+                   "Позиции на бирже останутся — закрывать вручную."),
+        "all":    (f"Стереть <b>все {d['total']}</b> записей и кулдауны?\n"
+                   "Позиции на бирже останутся."),
+    }
+    return ("⚠️ <b>ПОДТВЕРДИ</b>\n━━━━━━━━━━━━━━━━━━━━\n" + texts[what] +
+            "\n\n<i>Отменить будет нельзя.</i>",
+            InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="✅ Да, выполнить",
+                                      callback_data=f"wipe!:{what}"),
+                 InlineKeyboardButton(text="❌ Отмена", callback_data="nav:wipe")]]))
+
+
 def screen_ban() -> tuple[str, InlineKeyboardMarkup]:
     extra = db.extra_banned()
     base = sorted(C.blacklist())
@@ -482,7 +534,12 @@ def settings_kb(page: int = 0) -> InlineKeyboardMarkup:
         InlineKeyboardButton(text="📉 Объём: " + ("вкл" if C.USE_VOL_FADE else "выкл"),
                              callback_data="t:vol"),
     ])
-    rows.append([InlineKeyboardButton(text="♻️ Сброс", callback_data="preset:reset"),
+    rows.append([
+        InlineKeyboardButton(text="🔄 Подтягивать: " + ("вкл" if C.ADOPT_ORPHANS else "ВЫКЛ"),
+                             callback_data="t:adopt"),
+        InlineKeyboardButton(text="♻️ Сброс порогов", callback_data="preset:reset"),
+    ])
+    rows.append([InlineKeyboardButton(text="🧹 Очистка статистики", callback_data="nav:wipe"),
                  InlineKeyboardButton(text="⬅️ Меню", callback_data="nav:main")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -645,6 +702,9 @@ async def cb_nav(c: CallbackQuery):
     elif w == "ban":
         t, k = screen_ban()
         await safe_edit(c.message, t, k)
+    elif w == "wipe":
+        t, k = screen_wipe()
+        await safe_edit(c.message, t, k)
     elif w == "settings":
         await safe_edit(c.message, screen_settings(), settings_kb(0))
     elif w == "help":
@@ -715,12 +775,41 @@ async def cb_toggle(c: CallbackQuery):
         C.USE_BTC_FILTER = not C.USE_BTC_FILTER
         msg = ("₿ Фильтр рынка включён" if C.USE_BTC_FILTER
                else "₿ Фильтр рынка выключен")
+    elif w == "adopt":
+        C.ADOPT_ORPHANS = not C.ADOPT_ORPHANS
+        msg = ("🔄 Буду подтягивать позиции с биржи" if C.ADOPT_ORPHANS
+               else "🔄 Чужие позиции больше не трогаю")
     elif w == "vol":
         C.USE_VOL_FADE = not C.USE_VOL_FADE
         msg = ("📉 Фильтр затухания включён" if C.USE_VOL_FADE
                else "📉 Фильтр затухания выключен")
     await safe_edit(c.message, screen_settings(), settings_kb(0))
     await c.answer(msg)
+
+
+@dp.callback_query(F.data.startswith("wipe:"))
+async def cb_wipe_ask(c: CallbackQuery):
+    t, k = screen_wipe_confirm(c.data.split(":")[1])
+    await safe_edit(c.message, t, k)
+    await c.answer()
+
+
+@dp.callback_query(F.data.startswith("wipe!:"))
+async def cb_wipe_do(c: CallbackQuery):
+    what = c.data.split(":")[1]
+    if what == "closed":
+        n = db.clear_closed()
+        msg = f"🧽 Удалено закрытых сделок: {n}"
+    elif what == "open":
+        n = db.forget_open()
+        msg = f"🙈 Снято с ведения: {n}. Позиции на бирже остались."
+    else:
+        n = db.clear_all()
+        msg = f"💣 Стёрто записей: {n}"
+    log.info("очистка %s: %d", what, n)
+    t, k = screen_wipe()
+    await safe_edit(c.message, t, k)
+    await c.answer(msg, show_alert=True)
 
 
 @dp.callback_query(F.data.startswith("ban:"))
@@ -961,10 +1050,14 @@ async def init_trader():
     S.balance = bal
     S.trader = TradeManager(api, notify)
     log.info("Торговля подключена: env=%s equity=%.2f", C.TRADE_ENV, bal["equity"])
-    try:
-        found = await S.trader.adopt_orphans()
-    except Exception as e:      # noqa: BLE001
-        found, _ = [], log.warning("adopt on start: %s", e)
+    found = []
+    if C.ADOPT_ORPHANS:
+        try:
+            found = await S.trader.adopt_orphans()
+        except Exception as e:      # noqa: BLE001
+            log.warning("adopt on start: %s", e)
+    else:
+        log.info("подтягивание чужих позиций выключено (ADOPT_ORPHANS=0)")
     if C.ADMIN_CHAT_ID:
         extra = ("\n\n🔄 Подхватил открытые позиции:\n" + "\n".join(found)) if found else ""
         await bot.send_message(

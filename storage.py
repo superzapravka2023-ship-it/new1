@@ -188,3 +188,28 @@ def day_pnl() -> float:
     r = _q("SELECT COALESCE(SUM(pnl),0) s FROM trades WHERE closed_ts>=?",
            (int(time.time()) - 86400,), fetch="one")
     return float(r["s"]) if r else 0.0
+
+
+# ---------------- очистка ----------------
+def clear_closed() -> int:
+    """Удаляет закрытые сделки. Открытые остаются под управлением бота."""
+    r = _q("SELECT COUNT(*) c FROM trades WHERE status='closed'", fetch="one")
+    n = r["c"] if r else 0
+    _q("DELETE FROM trades WHERE status='closed'")
+    return n
+
+
+def clear_all() -> int:
+    """Удаляет вообще все записи о сделках. Позиции на бирже не трогает."""
+    r = _q("SELECT COUNT(*) c FROM trades", fetch="one")
+    n = r["c"] if r else 0
+    _q("DELETE FROM trades")
+    _q("DELETE FROM mutes")
+    return n
+
+
+def forget_open() -> int:
+    """Снимает с ведения открытые сделки — например, подтянутые от другого бота."""
+    rows = open_trades()
+    _q("DELETE FROM trades WHERE status='open'")
+    return len(rows)

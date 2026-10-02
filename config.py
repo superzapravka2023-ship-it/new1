@@ -24,6 +24,9 @@ BYBIT_API_KEY = os.getenv("BYBIT_API_KEY", "")
 BYBIT_API_SECRET = os.getenv("BYBIT_API_SECRET", "")
 
 AUTO_TRADE = _b("AUTO_TRADE")
+# Подтягивать позиции с биржи, которых нет в базе. Выключи, если на этом же
+# демо-счёте работает другой бот — иначе боты будут забирать сделки друг друга.
+ADOPT_ORPHANS = _b("ADOPT_ORPHANS", "0")
 POSITION_USD = _f("POSITION_USD", 1000)           # номинал сделки
 LEVERAGE = _i("LEVERAGE", 10)                     # маржа = POSITION_USD / LEVERAGE
 MARGIN_MODE = os.getenv("MARGIN_MODE", "cross")   # cross | isolated
