@@ -55,11 +55,24 @@ def _q(sql, args=(), fetch=None):
 
 
 # ---------------- настройки ----------------
-def load_settings():
+def load_settings() -> dict[str, tuple[float, float]]:
+    """Накатывает сохранённые кнопками настройки поверх переменных Railway.
+
+    ВАЖНО: база лежит на Volume и живёт дольше редеплоя, поэтому значение,
+    выставленное кнопкой или пресетом, перебивает переменную Railway — и так
+    до сброса. Возвращаем список таких подмен, чтобы бот сказал о них вслух,
+    а не менял параметры молча.
+    """
+    over: dict[str, tuple[float, float]] = {}
     for r in _q("SELECT key, value FROM settings", fetch="all"):
-        if hasattr(C, r["key"]):
-            cur = getattr(C, r["key"])
-            setattr(C, r["key"], int(r["value"]) if isinstance(cur, int) else r["value"])
+        if not hasattr(C, r["key"]):
+            continue
+        cur = getattr(C, r["key"])
+        new = int(r["value"]) if isinstance(cur, int) else float(r["value"])
+        if abs(float(new) - float(cur)) > 1e-9:
+            over[r["key"]] = (float(cur), float(new))
+        setattr(C, r["key"], new)
+    return over
 
 
 def save_setting(key, value):

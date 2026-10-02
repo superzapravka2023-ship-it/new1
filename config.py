@@ -37,16 +37,18 @@ MAX_SAME_SIDE = _i("MAX_SAME_SIDE", 3)
 EMA_PERIOD = _i("EMA_PERIOD", 20)                 # средняя, от которой меряем отрыв
 SIGMA_WINDOW = _i("SIGMA_WINDOW", 100)            # окно для расчёта сигмы отклонения
 ENTRY_SIGMA = _f("ENTRY_SIGMA", 2.5)              # порог входа, в сигмах
-MIN_SIGMA_PCT = _f("MIN_SIGMA_PCT", 0.30)         # монета должна реально ходить, %
-MAX_SIGMA_PCT = _f("MAX_SIGMA_PCT", 3.0)          # слишком дикая — пропускаем
+# 0.38, а не 0.30: при σ ниже 0.38% геометрия всё равно не даёт R:R 1.10,
+# и монета отсеивалась позже и молча. Честный порог = тот, что реально бьёт.
+MIN_SIGMA_PCT = _f("MIN_SIGMA_PCT", 0.39)         # монета должна реально ходить, %
+MAX_SIGMA_PCT = _f("MAX_SIGMA_PCT", 4.0)          # слишком дикая — пропускаем
 
 # рынок должен быть спокоен: перелёт одной монеты = перекос, всего рынка = тренд
-BTC_CALM_PCT = _f("BTC_CALM_PCT", 0.35)           # |движение BTC| за окно, %
+BTC_CALM_PCT = _f("BTC_CALM_PCT", 0.45)           # |движение BTC| за окно, %
 BTC_WINDOW_MIN = _i("BTC_WINDOW_MIN", 15)
 USE_BTC_FILTER = _b("USE_BTC_FILTER")
 
 # объём на выбросе должен гаснуть — тот, кто вываливал, выдохся
-VOL_FADE_MAX = _f("VOL_FADE_MAX", 0.70)           # объём последней свечи / объём выброса
+VOL_FADE_MAX = _f("VOL_FADE_MAX", 0.80)           # объём последней свечи / объём выброса
 USE_VOL_FADE = _b("USE_VOL_FADE")
 IMPULSE_LOOKBACK = _i("IMPULSE_LOOKBACK", 6)      # где ищем свечу-выброс
 
@@ -65,13 +67,16 @@ FEE_MAKER = _f("FEE_MAKER", 0.020)                # %, выход лимитко
 # ==================== СКАНЕР ====================
 TIMEFRAME = os.getenv("TIMEFRAME", "5")
 CANDLES = _i("CANDLES", 150)
-SCAN_INTERVAL = _i("SCAN_INTERVAL", 30)
+# Перелёт в 2.5σ живёт одну-три свечи. Полный обход должен укладываться
+# в это окно, иначе бот физически не видит часть движений.
+SCAN_INTERVAL = _i("SCAN_INTERVAL", 15)
 SYNC_INTERVAL = _i("SYNC_INTERVAL", 15)
-BATCH_SIZE = _i("BATCH_SIZE", 45)
-COOLDOWN_MIN = _i("COOLDOWN_MIN", 45)
+BATCH_SIZE = _i("BATCH_SIZE", 70)
+REQ_PAUSE = _f("REQ_PAUSE", 0.08)                 # пауза между свечами, сек
+COOLDOWN_MIN = _i("COOLDOWN_MIN", 30)
 
-MIN_TURNOVER = _f("MIN_TURNOVER", 10_000_000)
-MAX_SPREAD_PCT = _f("MAX_SPREAD_PCT", 0.06)
+MIN_TURNOVER = _f("MIN_TURNOVER", 7_000_000)
+MAX_SPREAD_PCT = _f("MAX_SPREAD_PCT", 0.10)
 MIN_AGE_DAYS = _i("MIN_AGE_DAYS", 30)
 MIN_PRICE = _f("MIN_PRICE", 0.0000001)
 BLACKLIST = os.getenv(

@@ -75,12 +75,18 @@ class Signal:
         return C.breakeven_wr(self.tp_pct, self.sl_pct)
 
 
+# Последняя разобранная монета — чтобы бот мог показать воронку отбора,
+# а не только итоговое «сигналов нет». Заполняется на каждом вызове scan().
+probe: dict[str, float] = {"sigma": 0.0, "dev_sigma": 0.0, "bars": 0}
+
+
 def scan(t: Ticker, candles: list[Candle], btc_move: float
          ) -> tuple[Optional[Signal], str]:
     """Возвращает (сигнал | None, причина отказа)."""
+    probe.update(sigma=0.0, dev_sigma=0.0, bars=len(candles))
     need = C.SIGMA_WINDOW + C.EMA_PERIOD + 5
     if len(candles) < need:
-        return None, "мало истории"
+        return None, f"мало истории ({len(candles)} из {need})"
 
     closes = [c.c for c in candles]
     emas = ema_series(closes, C.EMA_PERIOD)
@@ -92,14 +98,18 @@ def scan(t: Ticker, candles: list[Candle], btc_move: float
     devs = [(closes[i] - emas[i]) / emas[i] * 100
             for i in range(len(closes) - C.SIGMA_WINDOW, len(closes))]
     sigma = pstdev(devs[:-1]) if len(devs) > 2 else 0.0
+    probe["sigma"] = sigma
     if sigma <= 0:
         return None, "нулевой разброс"
+
+    dev_pct = (last.c - ema) / ema * 100
+    probe["dev_sigma"] = abs(dev_pct / sigma)
+
     if sigma < C.MIN_SIGMA_PCT:
         return None, f"монета стоит на месте (σ {sigma:.2f}%)"
     if sigma > C.MAX_SIGMA_PCT:
         return None, f"слишком дикая (σ {sigma:.2f}%)"
 
-    dev_pct = (last.c - ema) / ema * 100
     dev_sigma = dev_pct / sigma
     if abs(dev_sigma) < C.ENTRY_SIGMA:
         return None, f"отрыв {abs(dev_sigma):.2f}σ < {C.ENTRY_SIGMA:g}σ"

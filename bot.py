@@ -1,4 +1,5 @@
 import asyncio
+import collections
 import contextlib
 import logging
 import time
@@ -15,7 +16,7 @@ from aiogram.types import (CallbackQuery, InlineKeyboardButton,
 import config as C
 import storage as db
 from bybit import Bybit, Ticker
-from strategy import Signal, btc_move_pct, scan
+from strategy import Signal, btc_move_pct, probe, scan
 from trade import BybitTrade, TradeManager, plural
 
 logging.basicConfig(level=logging.INFO,
@@ -27,13 +28,21 @@ dp = Dispatcher()
 
 ENV_LABEL = {"demo": "🧪 ДЕМО", "testnet": "🧪 TESTNET", "live": "💵 РЕАЛ"}
 
+# Пресеты согласованы: при меньшем пороге входа тейк выходит мельче,
+# поэтому σ монеты требуется БОЛЬШЕ, иначе геометрия всё равно не пустит.
 PRESETS = {
-    "many": ("🌊 Больше сделок", {"ENTRY_SIGMA": 2.0, "MIN_RR": 1.05,
-                                  "BTC_CALM_PCT": 0.5, "COOLDOWN_MIN": 30}),
-    "bal":  ("⚖️ Баланс",       {"ENTRY_SIGMA": 2.5, "MIN_RR": 1.10,
-                                  "BTC_CALM_PCT": 0.35, "COOLDOWN_MIN": 45}),
-    "pick": ("🎯 Строже",        {"ENTRY_SIGMA": 3.0, "MIN_RR": 1.25,
-                                  "BTC_CALM_PCT": 0.25, "COOLDOWN_MIN": 90}),
+    "many": ("🌊 Больше сделок", {"ENTRY_SIGMA": 2.3, "TP_FRACTION": 0.70,
+                                  "MIN_RR": 1.05, "MIN_SIGMA_PCT": 0.30,
+                                  "MIN_TP_PCT": 0.40, "BTC_CALM_PCT": 0.60,
+                                  "VOL_FADE_MAX": 0.90, "COOLDOWN_MIN": 20}),
+    "bal":  ("⚖️ Баланс",       {"ENTRY_SIGMA": 2.5, "TP_FRACTION": 0.60,
+                                  "MIN_RR": 1.10, "MIN_SIGMA_PCT": 0.39,
+                                  "MIN_TP_PCT": 0.45, "BTC_CALM_PCT": 0.45,
+                                  "VOL_FADE_MAX": 0.80, "COOLDOWN_MIN": 30}),
+    "pick": ("🎯 Строже",        {"ENTRY_SIGMA": 3.0, "TP_FRACTION": 0.60,
+                                  "MIN_RR": 1.25, "MIN_SIGMA_PCT": 0.32,
+                                  "MIN_TP_PCT": 0.50, "BTC_CALM_PCT": 0.30,
+                                  "VOL_FADE_MAX": 0.70, "COOLDOWN_MIN": 60}),
 }
 
 
@@ -57,8 +66,43 @@ class State:
     trade_err = ""
     balance = {"equity": 0.0, "available": 0.0}
 
+    # ---- диагностика: почему не было сделок
+    why = collections.Counter()          # на каком фильтре отвалилось
+    gates = collections.Counter()        # почему не вошли при живом сигнале
+    best_sigma = 0.0                     # самый большой отрыв, что видели
+    best_sym = ""
+    best_ts = 0.0
+    sigma_hist = collections.Counter()   # распределение σ монет
+    entry_errs = 0
+    last_entry_err = ""
+    last_entry_err_ts = 0.0
+    last_signal_ts = 0.0
+    empty_universe = 0                   # циклов с пустым списком монет
+    overrides: dict[str, tuple[float, float]] = {}   # база перебила Railway
+
 
 S = State()
+
+
+REASONS = (
+    ("мало истории",   "📉 мало свечей"),
+    ("нулевой разброс", "📉 нулевой разброс"),
+    ("монета стоит",   "😴 монета тихая (σ мала)"),
+    ("слишком дикая",  "🌪 слишком дикая (σ велика)"),
+    ("отрыв",          "📏 отрыв меньше порога"),
+    ("рынок двигается", "₿ BTC шевелится"),
+    ("выброс ещё идёт", "🔊 объём не погас"),
+    ("цель мала",      "💸 тейк мал, комиссия съест"),
+    ("стоп широк",     "🛑 стоп шире потолка"),
+    ("соотношение",    "⚖️ R:R ниже порога"),
+)
+
+
+def why_bucket(why: str) -> str:
+    for head, label in REASONS:
+        if why.startswith(head):
+            return label
+    return why[:28]
 
 
 # ================================================================ утилиты
@@ -137,6 +181,7 @@ def menu_kb() -> InlineKeyboardMarkup:
          InlineKeyboardButton(text="📈 30 дней", callback_data="nav:month")],
         [InlineKeyboardButton(text="📜 История", callback_data="nav:hist"),
          InlineKeyboardButton(text="📡 Статус", callback_data="nav:status")],
+        [InlineKeyboardButton(text="🔬 Почему нет сделок", callback_data="nav:diag")],
         [InlineKeyboardButton(text="⚙️ Настройки", callback_data="nav:settings"),
          InlineKeyboardButton(text="⛔️ Чёрный список", callback_data="nav:ban")],
         [InlineKeyboardButton(text="❓ Стратегия", callback_data="nav:help")],
@@ -202,6 +247,109 @@ def screen_status() -> str:
         f"оборот      ≥ {money(C.MIN_TURNOVER)}\n"
         f"кулдаун       {C.COOLDOWN_MIN} мин</pre>"
     )
+
+
+def screen_diag() -> tuple[str, InlineKeyboardMarkup]:
+    """Живая воронка отбора: на каком именно шаге умирают все кандидаты."""
+    total = sum(S.why.values())
+    L = ["🔬 <b>ДИАГНОСТИКА</b>",
+         "━━━━━━━━━━━━━━━━━━━━"]
+
+    if S.overrides:
+        L.append("ℹ️ <b>Эти параметры взяты из кнопок, а не из Railway:</b>")
+        L.append("<pre>")
+        for k, (env, cur) in S.overrides.items():
+            L.append(f"{LABELS.get(k, k)[:14]:<14} {_fmt(k, env)} → {_fmt(k, cur)}")
+        L.append("</pre>")
+        L.append("<i>Сброс: ⚙️ Настройки → ♻️</i>\n")
+
+    if not total:
+        L.append("Сканер ещё не сделал ни одной проверки.\n")
+        if S.empty_universe:
+            L.append(f"⚠️ Список монет пуст уже <b>{S.empty_universe}</b> циклов.\n"
+                     f"Смягчи спред (сейчас ≤{C.MAX_SPREAD_PCT:g}%) "
+                     f"или оборот (≥{money(C.MIN_TURNOVER)}).")
+        return "\n".join(L), nav(back="diag")
+
+    L.append(f"Проверок: <b>{total}</b> · монет в отборе <b>{S.scanned}</b> "
+             f"из {S.symbols}\n")
+    L.append("<b>Где умирают кандидаты</b>")
+    L.append("<pre>")
+    for label, n in S.why.most_common(10):
+        share = n / total * 100
+        L.append(f"{bar(share, 100, 8)} {share:>5.1f}%  {label}")
+    L.append("</pre>")
+
+    # самый близкий к порогу отрыв — сразу видно, порог виноват или нет
+    if S.best_sigma:
+        L.append(f"📏 Максимальный отрыв за всё время:\n"
+                 f"   <b>{S.best_sigma:.2f}σ</b> · {S.best_sym} · "
+                 f"{ago(S.best_ts)} назад\n"
+                 f"   порог входа <b>{C.ENTRY_SIGMA:g}σ</b>")
+
+    # распределение собственной сигмы — проходят ли монеты по геометрии
+    if S.sigma_hist:
+        tot = sum(S.sigma_hist.values())
+        L.append("\n<b>σ монет (собственный разброс)</b>")
+        L.append("<pre>")
+        top = max(S.sigma_hist.values())
+        for key in ("<0.2", "0.2-0.3", "0.3-0.4", "0.4-0.6", "0.6-1.0", ">1.0"):
+            n = S.sigma_hist.get(key, 0)
+            L.append(f"{key:>8}%  {bar(n, top, 8)} {n / tot * 100:>5.1f}%")
+        L.append("</pre>")
+        L.append(f"<i>Для R:R {C.MIN_RR:g} при отрыве {C.ENTRY_SIGMA:g}σ "
+                 f"нужна σ ≥ {need_sigma():.2f}%</i>")
+
+    L.append(f"\n🎯 Сигналов найдено: <b>{S.signals_seen}</b>"
+             + (f" · последний {ago(S.last_signal_ts)} назад"
+                if S.signals_seen and S.last_signal_ts else ""))
+
+    if S.gates:
+        L.append("\n<b>Сигнал был, но не вошли</b>")
+        L.append("<pre>")
+        for g, n in S.gates.most_common(6):
+            L.append(f"{n:>4} × {g}")
+        L.append("</pre>")
+
+    if S.entry_errs:
+        L.append(f"\n⛔️ <b>Ошибок входа: {S.entry_errs}</b> "
+                 f"({ago(S.last_entry_err_ts)} назад)\n"
+                 f"<code>{S.last_entry_err}</code>")
+
+    if S.empty_universe:
+        L.append(f"\n⚠️ Пустой список монет: <b>{S.empty_universe}</b> циклов")
+
+    return "\n".join(L), nav(
+        [InlineKeyboardButton(text="🧹 Сбросить счётчики", callback_data="diag:reset")],
+        back="diag")
+
+
+def need_sigma() -> float:
+    """Минимальная σ монеты, при которой геометрия проходит по R:R."""
+    lo, hi = 0.01, 10.0
+    for _ in range(60):
+        mid = (lo + hi) / 2
+        tp = C.TP_FRACTION * C.ENTRY_SIGMA * mid
+        sl = C.SL_SIGMA * mid
+        if tp < C.MIN_TP_PCT or C.rr_after_fees(tp, sl) < C.MIN_RR:
+            lo = mid
+        else:
+            hi = mid
+    return hi
+
+
+def sigma_key(s: float) -> str:
+    if s < 0.2:
+        return "<0.2"
+    if s < 0.3:
+        return "0.2-0.3"
+    if s < 0.4:
+        return "0.3-0.4"
+    if s < 0.6:
+        return "0.4-0.6"
+    if s < 1.0:
+        return "0.6-1.0"
+    return ">1.0"
 
 
 def open_pnl() -> tuple[float, float]:
@@ -682,7 +830,12 @@ async def cb_nav(c: CallbackQuery):
     if w == "main":
         await safe_edit(c.message, screen_main(), menu_kb())
     elif w == "status":
-        await safe_edit(c.message, screen_status(), nav(back="status"))
+        await safe_edit(c.message, screen_status(), nav(
+            [InlineKeyboardButton(text="🔬 Диагностика", callback_data="nav:diag")],
+            back="status"))
+    elif w == "diag":
+        t, k = screen_diag()
+        await safe_edit(c.message, t, k)
     elif w == "pos":
         t, k = screen_positions()
         await safe_edit(c.message, t, k)
@@ -710,6 +863,20 @@ async def cb_nav(c: CallbackQuery):
     elif w == "help":
         await safe_edit(c.message, HELP, nav(back="help"))
     await c.answer()
+
+
+@dp.callback_query(F.data == "diag:reset")
+async def cb_diag_reset(c: CallbackQuery):
+    if not admin_only(c.from_user.id):
+        return await c.answer("нет доступа", show_alert=True)
+    S.why.clear()
+    S.gates.clear()
+    S.sigma_hist.clear()
+    S.best_sigma, S.best_sym, S.best_ts = 0.0, "", 0.0
+    S.entry_errs, S.last_entry_err, S.last_entry_err_ts = 0, "", 0.0
+    t, k = screen_diag()
+    await safe_edit(c.message, t, k)
+    await c.answer("🧹 Счётчики сброшены")
 
 
 @dp.callback_query(F.data.startswith("pos:"))
@@ -913,21 +1080,43 @@ async def alert_errors():
 
 async def handle_signal(sig: Signal):
     S.signals_seen += 1
+    S.last_signal_ts = time.time()
     if not (S.trader and C.AUTO_TRADE):
+        S.gates["торговля выключена"] += 1
         return
+    crashed = False
     try:
         ok, msg = await S.trader.open_trade(sig)
     except Exception as e:      # noqa: BLE001
         log.exception("entry %s", sig.symbol)
-        ok, msg = False, f"⚠️ {sig.symbol}: вход не удался — {e}"
+        ok, msg, crashed = False, f"{type(e).__name__}: {e}"[:180], True
     if ok:
         await bot.send_message(C.ADMIN_CHAT_ID, msg, reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[[InlineKeyboardButton(text="💼 Позиции",
                                                    callback_data="nav:pos")]]))
-    else:
-        log.info("вход не состоялся: %s", msg)
-        if C.NOTIFY_BLOCKED:
-            await bot.send_message(C.ADMIN_CHAT_ID, msg)
+        return
+
+    log.info("вход не состоялся: %s", msg)
+    # Ворота (слоты, кулдаун, та же монета) — нормальная работа, просто счётчик.
+    # Всё остальное — техническая поломка, о ней молчать нельзя.
+    gate_words = ("уже открыта", "занято ", "уже ", "кулдаун")
+    body = msg.lstrip("⛔️ ")
+    technical = crashed or not any(w in body for w in gate_words)
+    S.gates[body[:40]] += 1
+    if technical:
+        S.entry_errs += 1
+        S.last_entry_err = msg
+        S.last_entry_err_ts = time.time()
+        if C.ADMIN_CHAT_ID:
+            await bot.send_message(
+                C.ADMIN_CHAT_ID,
+                f"⛔️ <b>ВХОД НЕ УДАЛСЯ</b> · {sig.symbol}\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                f"<code>{msg}</code>\n\n"
+                f"Сигнал был: {abs(sig.dev_sigma):.2f}σ, R:R {sig.rr:.2f}\n"
+                f"<i>Ошибок входа всего: {S.entry_errs}</i>")
+    elif C.NOTIFY_BLOCKED:
+        await bot.send_message(C.ADMIN_CHAT_ID, msg)
 
 
 async def scan_loop():
@@ -965,8 +1154,24 @@ async def scan_loop():
                 pass
 
             if not S.universe:
+                S.empty_universe += 1
+                # это тихая смерть: бот «работает», но смотреть ему не на что
+                if S.empty_universe in (3, 30, 300) and C.ADMIN_CHAT_ID:
+                    await bot.send_message(
+                        C.ADMIN_CHAT_ID,
+                        "⚠️ <b>НЕЧЕГО СКАНИРОВАТЬ</b>\n"
+                        "━━━━━━━━━━━━━━━━━━━━\n"
+                        f"Ни одна монета не прошла отбор "
+                        f"({S.empty_universe} циклов подряд).\n\n"
+                        f"Оборот ≥ {money(C.MIN_TURNOVER)}\n"
+                        f"Спред ≤ {C.MAX_SPREAD_PCT:g}%\n"
+                        f"Возраст ≥ {C.MIN_AGE_DAYS} дней\n"
+                        f"Контрактов всего: {S.symbols}\n\n"
+                        "<i>Сделок не будет. Смягчи спред или оборот "
+                        "в ⚙️ Настройках.</i>")
                 await asyncio.sleep(C.SCAN_INTERVAL)
                 continue
+            S.empty_universe = 0
             if cursor >= len(S.universe):
                 cursor = 0
             batch = S.universe[cursor:cursor + C.BATCH_SIZE]
@@ -974,12 +1179,22 @@ async def scan_loop():
 
             for sym in batch:
                 t = tickers.get(sym)
-                if not t or db.in_cooldown(sym):
+                if not t:
+                    continue
+                if db.in_cooldown(sym):
+                    S.why["⏳ кулдаун по монете"] += 1
                     continue
                 try:
                     candles = await api.klines(sym, C.TIMEFRAME, C.CANDLES)
                     sig, why = scan(t, candles, S.btc_move)
                     S.checked += 1
+                    # ---- воронка: что именно отсекло монету
+                    S.why["🎯 сигнал" if sig else why_bucket(why)] += 1
+                    if probe["sigma"] > 0:
+                        S.sigma_hist[sigma_key(probe["sigma"])] += 1
+                    if probe["dev_sigma"] > S.best_sigma:
+                        S.best_sigma = probe["dev_sigma"]
+                        S.best_sym, S.best_ts = sym, time.time()
                 except Exception as e:      # noqa: BLE001
                     log.warning("scan %s: %s", sym, e)
                     S.errors += 1
@@ -989,7 +1204,7 @@ async def scan_loop():
                     continue
                 if sig and C.ADMIN_CHAT_ID:
                     await handle_signal(sig)
-                await asyncio.sleep(0.12)
+                await asyncio.sleep(C.REQ_PAUSE)
 
         except Exception as e:      # noqa: BLE001
             S.errors += 1
@@ -1069,11 +1284,30 @@ async def init_trader():
             f"стоп {C.SL_SIGMA:g}σ{extra}".replace(",", " "))
 
 
+async def warn_overrides():
+    """Говорит вслух, если кнопки/пресет перебивают переменные Railway."""
+    if not S.overrides or not C.ADMIN_CHAT_ID:
+        return
+    rows = "\n".join(
+        f"{LABELS.get(k, k)}: {_fmt(k, env)} → <b>{_fmt(k, cur)}</b>"
+        for k, (env, cur) in S.overrides.items())
+    await bot.send_message(
+        C.ADMIN_CHAT_ID,
+        "ℹ️ <b>НАСТРОЙКИ ИЗ КНОПОК ПЕРЕБИВАЮТ RAILWAY</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"{rows}\n\n"
+        "<i>Это сохранено в базе на Volume и живёт дольше редеплоя. "
+        "Чтобы вернуть значения из Railway — ⚙️ Настройки → ♻️ Сброс.</i>")
+
+
 async def main():
     if not C.BOT_TOKEN:
         raise SystemExit("BOT_TOKEN не задан")
-    db.load_settings()
+    S.overrides = db.load_settings()
+    if S.overrides:
+        log.warning("настройки из базы перебивают Railway: %s", S.overrides)
     await init_trader()
+    asyncio.create_task(warn_overrides())
     asyncio.create_task(scan_loop())
     asyncio.create_task(trade_loop())
     asyncio.create_task(balance_loop())
